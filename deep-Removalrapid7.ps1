@@ -25,14 +25,6 @@ Set-StrictMode -Version Latest
     Run from an elevated PowerShell session.
     Tested conceptually for Windows 10/11 and Windows Server 2016–2022.
 
-    Reference themes reflected in this script:
-      - Rapid7 documentation indicates Windows agent operations can be managed through the
-        installer / service controls.
-      - Community experience shows that, when uninstall metadata is broken, manual cleanup of
-        service registrations, installation folders, and stale registry uninstall records may
-        be required as a last resort.
-      - Community experience also shows a reboot may be required if a file lock cannot be released.
-
 .PARAMETER TargetFolder
     Installation root for the Rapid7 Insight Agent.
 
@@ -58,17 +50,16 @@ Set-StrictMode -Version Latest
     This is intentionally aggressive and should be used only as part of last-resort cleanup.
 
 .EXAMPLE
-    Uninstall-Rapid7InsightAgentHardended -WhatIf
+    Uninstall-Rapid7InsightAgentHardened -WhatIf
 
 .EXAMPLE
-    Uninstall-Rapid7InsightAgentHardended -Confirm:$false
+    Uninstall-Rapid7InsightAgentHardened -Confirm:$false
 
 .EXAMPLE
-    Uninstall-Rapid7InsightAgentHardended -UninstallToken 'YOURTOKEN' -Confirm:$false
-
+    Uninstall-Rapid7InsightAgentHardened -UninstallToken 'YOURTOKEN' -Confirm:$false
 #>
 
-function Uninstall-Rapid7InsightAgentHardended {
+function Uninstall-Rapid7InsightAgentHardened {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
         [Parameter()]
@@ -173,19 +164,29 @@ function Uninstall-Rapid7InsightAgentHardended {
                 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
             )
 
-            $results = foreach ($path in $paths) {
-                Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
-                    Where-Object {
-                        $_.DisplayName -and (
-                            $Patterns | Where-Object { $_ -and ($_.Trim()) } | ForEach-Object {
-                                if ($_.Length -gt 0 -and $PSItem.DisplayName -like $_) { $true }
-                            }
-                        )
+            $results = New-Object System.Collections.Generic.List[object]
+
+            foreach ($path in $paths) {
+                $items = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+
+                foreach ($item in $items) {
+                    # Enforce static properties via Select-Object to block strict-mode missing property exceptions.
+                    $safeItem = $item | Select-Object -Property DisplayName, DisplayVersion, Publisher, UninstallString, QuietUninstallString, PSPath, PSChildName
+
+                    if ($null -eq $safeItem.DisplayName -or [string]::IsNullOrWhiteSpace($safeItem.DisplayName)) {
+                        continue
                     }
+
+                    foreach ($pattern in $Patterns) {
+                        if ($safeItem.DisplayName -like $pattern) {
+                            [void]$results.Add($safeItem)
+                            break
+                        }
+                    }
+                }
             }
 
-            # De-duplicate by PSPath to avoid duplicate actions.
-            $results | Sort-Object -Property PSPath -Unique
+            return $results | Sort-Object -Property PSPath -Unique
         }
 
         function Get-InstallerProductKeys {
@@ -203,11 +204,13 @@ function Uninstall-Rapid7InsightAgentHardended {
             $keys = foreach ($key in Get-ChildItem -Path $productRoot -ErrorAction SilentlyContinue) {
                 try {
                     $item = Get-ItemProperty -Path $key.PSPath -ErrorAction Stop
-                    if ($item.ProductName) {
+                    $safeItem = $item | Select-Object -Property ProductName, PSPath
+
+                    if ($safeItem.ProductName) {
                         foreach ($pattern in $Patterns) {
-                            if ($item.ProductName -like $pattern) {
+                            if ($safeItem.ProductName -like $pattern) {
                                 [pscustomobject]@{
-                                    ProductName = $item.ProductName
+                                    ProductName = $safeItem.ProductName
                                     PSPath      = $key.PSPath
                                 }
                                 break
@@ -253,7 +256,7 @@ function Uninstall-Rapid7InsightAgentHardended {
                     }
                 }
                 catch {
-                    # Accessing .Path can fail for protected/system processes. That is expected.
+                    # Accessing .Path can fail for protected/system processes.
                 }
             }
 
@@ -267,9 +270,6 @@ function Uninstall-Rapid7InsightAgentHardended {
                 [string]$CommandLine
             )
 
-            # Minimal commandline splitter:
-            #   - if quoted, executable is first quoted token
-            #   - otherwise executable is first whitespace-delimited token
             $trimmed = $CommandLine.Trim()
 
             if ($trimmed -match '^\s*"([^"]+)"\s*(.*)$') {
@@ -351,8 +351,6 @@ function Uninstall-Rapid7InsightAgentHardended {
                 $output = & openfiles /query /fo csv 2>&1
                 $text = ($output | Out-String)
 
-                # If local tracking is not enabled, Windows typically states that local open file info
-                # is unavailable until the maintain objects list flag is enabled and the machine restarted.
                 if ($text -match 'maintain objects list' -or $text -match 'local open files') {
                     return $false
                 }
@@ -463,7 +461,6 @@ function Uninstall-Rapid7InsightAgentHardended {
                 try {
                     Write-Log -Message ("Attempting directory removal: [{0}]" -f $Path) -Level INFO
 
-                    # Log a pre-removal inventory snapshot for forensic purposes.
                     try {
                         Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop |
                             Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc |
@@ -489,7 +486,6 @@ function Uninstall-Rapid7InsightAgentHardended {
                     Write-Log -Message ("Unexpected filesystem cleanup failure removing [{0}] - {1}" -f $Path, $_.Exception.Message) -Level ERROR
                 }
 
-                # If we reach here, removal failed. Attempt to provide useful lock diagnostics.
                 $trackingEnabled = Test-OpenFilesLocalTrackingEnabled
                 if ($trackingEnabled) {
                     Write-Log -Message 'Attempting lock diagnostics via openfiles.exe ...' -Level INFO
@@ -545,11 +541,9 @@ function Uninstall-Rapid7InsightAgentHardended {
 
             $resolved = $candidate.Trim()
 
-            # If msiexec is used, normalize toward a quiet uninstall when it is safe to do so.
             if ($resolved -match '(?i)msiexec(\.exe)?') {
-                # Preserve provided command but ensure we prefer an uninstall action.
                 if ($resolved -notmatch '(?i)\s/x\s' -and $resolved -notmatch '(?i)\s/uninstall\s') {
-                    if ($RegistryEntry.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$') {
+                    if ($RegistryEntry.PSChildName -and $RegistryEntry.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$') {
                         $resolved = "msiexec.exe /x $($RegistryEntry.PSChildName)"
                     }
                 }
@@ -559,8 +553,6 @@ function Uninstall-Rapid7InsightAgentHardended {
                 }
             }
 
-            # Some environments require a token for automated removal.
-            # Append only if caller supplied one and the uninstall command does not already contain it.
             if ($UninstallToken -and $resolved -notmatch '(?i)UNINSTALLTOKEN=') {
                 $resolved += " UNINSTALLTOKEN=$UninstallToken"
             }
@@ -615,13 +607,15 @@ function Uninstall-Rapid7InsightAgentHardended {
                 $initialState.ProcessCountByFolderPrefix) -Level INFO
 
             foreach ($entry in $initialState.RegistryEntries) {
+                $dispName   = if ($entry.DisplayName) { $entry.DisplayName } else { '' }
+                $dispVer    = if ($entry.DisplayVersion) { $entry.DisplayVersion } else { '' }
+                $publisher  = if ($entry.Publisher) { $entry.Publisher } else { '' }
+                $unString   = if ($entry.UninstallString) { $entry.UninstallString } else { '' }
+                $qUnString  = if ($entry.QuietUninstallString) { $entry.QuietUninstallString } else { '' }
+                $psPath     = if ($entry.PSPath) { $entry.PSPath } else { '' }
+
                 Write-Log -Message ("RegistryEntry DisplayName=[{0}] DisplayVersion=[{1}] Publisher=[{2}] UninstallString=[{3}] QuietUninstallString=[{4}] PSPath=[{5}]" -f `
-                    $entry.DisplayName,
-                    $entry.DisplayVersion,
-                    $entry.Publisher,
-                    $entry.UninstallString,
-                    $entry.QuietUninstallString,
-                    $entry.PSPath) -Level DEBUG
+                    $dispName, $dispVer, $publisher, $unString, $qUnString, $psPath) -Level DEBUG
             }
 
             if (-not $initialState.FolderExists -and -not $initialState.ServiceExists -and $initialState.RegistryEntryCount -eq 0) {
@@ -632,7 +626,8 @@ function Uninstall-Rapid7InsightAgentHardended {
             # -----------------------------------------------------------------
             # PHASE 2 - Supported uninstall attempt (best practice first)
             # -----------------------------------------------------------------
-            if (-not $SkipOfficialUninstall -and $initialState.RegistryEntries.Count -gt 0) {
+            # HARDENED FIX: Wrap collection inside an explicit array block @(...) so strict-mode won't crash when RegistryEntries holds exactly 1 item.
+            if (-not $SkipOfficialUninstall -and @($initialState.RegistryEntries).Count -gt 0) {
                 Write-Section -Title 'PHASE 2 - SUPPORTED / REGISTRY-DISCOVERED UNINSTALL ATTEMPT'
                 $result.SupportedUninstallAttempted = $true
 
@@ -640,25 +635,28 @@ function Uninstall-Rapid7InsightAgentHardended {
                     $commandLine = Build-UninstallCommand -RegistryEntry $entry
 
                     if (-not $commandLine) {
-                        Write-Log -Message ("No executable uninstall string found for entry [{0}] at [{1}]. Skipping supported uninstall attempt for this entry." -f $entry.DisplayName, $entry.PSPath) -Level WARN
+                        $dispName = if ($entry.DisplayName) { $entry.DisplayName } else { 'Unknown' }
+                        Write-Log -Message ("No executable uninstall string found for entry [{0}] at [{1}]. Skipping supported uninstall attempt for this entry." -f $dispName, $entry.PSPath) -Level WARN
                         continue
                     }
 
                     $parsed = Split-CommandLine -CommandLine $commandLine
+                    $dispName = if ($entry.DisplayName) { $entry.DisplayName } else { 'Unknown' }
 
-                    if ($PSCmdlet.ShouldProcess($entry.DisplayName, "Run uninstall command: $commandLine")) {
+                    if ($PSCmdlet.ShouldProcess($dispName, "Run uninstall command: $commandLine")) {
                         try {
-                            # Common Windows installer success codes:
-                            #   0    = success
-                            #   1605 = product not installed
-                            #   1614 = product uninstalled
-                            #   3010 = success, reboot required
+                            # HARDENED FIX: Prevent msiexec background process locks from execution freezes during a -WhatIf deployment mock run.
+                            if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('WhatIf')) {
+                                Write-Log -Message "[WHATIF SIMULATION] Would execute external installer path: [$($parsed.FilePath)] with arguments: [$($parsed.ArgumentList)]" -Level INFO
+                                continue
+                            }
+
                             $cmdResult = Invoke-ExternalCommand -FilePath $parsed.FilePath `
                                                                 -ArgumentList $parsed.ArgumentList `
                                                                 -SuccessExitCodes @(0, 1605, 1614, 3010) `
-                                                                -ActionDescription ("Uninstall [{0}]" -f $entry.DisplayName)
+                                                                -ActionDescription ("Uninstall [{0}]" -f $dispName)
 
-                            Write-Log -Message ("Supported uninstall completed for [{0}] ExitCode=[{1}]" -f $entry.DisplayName, $cmdResult.ExitCode) -Level INFO
+                            Write-Log -Message ("Supported uninstall completed for [{0}] ExitCode=[{1}]" -f $dispName, $cmdResult.ExitCode) -Level INFO
 
                             if ($cmdResult.ExitCode -eq 3010) {
                                 $result.RebootRecommended = $true
@@ -666,8 +664,8 @@ function Uninstall-Rapid7InsightAgentHardended {
                             }
                         }
                         catch {
-                            Write-Log -Message ("Supported uninstall failed for [{0}] - {1}" -f $entry.DisplayName, $_.Exception.Message) -Level ERROR
-                            $result.Notes += ("Supported uninstall failed for [{0}]" -f $entry.DisplayName)
+                            Write-Log -Message ("Supported uninstall failed for [{0}] - {1}" -f $dispName, $_.Exception.Message) -Level ERROR
+                            $result.Notes += ("Supported uninstall failed for [{0}]" -f $dispName)
                         }
                     }
                 }
@@ -703,7 +701,6 @@ function Uninstall-Rapid7InsightAgentHardended {
             Write-Section -Title 'PHASE 3 - SURGICAL CLEANUP'
             $result.SurgicalCleanupAttempted = $true
 
-            # Refresh state just before surgery.
             $preSurgeryState = Get-Rapid7State
 
             # 3A. Kill known agent processes first.
@@ -740,9 +737,6 @@ function Uninstall-Rapid7InsightAgentHardended {
 
                 if ($PSCmdlet.ShouldProcess($ServiceName, 'sc.exe delete')) {
                     try {
-                        # sc.exe often returns:
-                        #   [SC] DeleteService SUCCESS
-                        # even when actual removal completes after service manager refresh / reboot.
                         $deleteResult = Invoke-ExternalCommand -FilePath 'sc.exe' `
                                                                -ArgumentList ("delete {0}" -f $ServiceName) `
                                                                -SuccessExitCodes @(0) `
@@ -773,7 +767,8 @@ function Uninstall-Rapid7InsightAgentHardended {
             Write-Log -Message 'Subphase 3E - Remove uninstall registry entries.' -Level INFO
             $remainingUninstallEntries = Get-RegistryUninstallEntries -Patterns $DisplayNamePatterns
             foreach ($entry in $remainingUninstallEntries) {
-                Write-Log -Message ("Residual uninstall entry found DisplayName=[{0}] PSPath=[{1}]" -f $entry.DisplayName, $entry.PSPath) -Level WARN
+                $dispName = if ($entry.DisplayName) { $entry.DisplayName } else { 'Unknown' }
+                Write-Log -Message ("Residual uninstall entry found DisplayName=[{0}] PSPath=[{1}]" -f $dispName, $entry.PSPath) -Level WARN
                 Remove-RegistryKeySafe -Path $entry.PSPath -Reason 'Residual uninstall metadata'
             }
 
@@ -869,8 +864,13 @@ function Uninstall-Rapid7InsightAgentHardended {
 # ---------------------------------------------------------------------------
 # Standalone execution block
 # ---------------------------------------------------------------------------
-# If the script is run directly as a .ps1, execute the function automatically.
-# Remove -Confirm:$false if you want interactive confirmation prompts.
 if ($MyInvocation.MyCommand.Path) {
-    Uninstall-Rapid7InsightAgentHardended -Confirm:$false
+    $params = @{}
+    if ($PSBoundParameters.ContainsKey('WhatIf')) {
+        $params['WhatIf'] = $PSBoundParameters['WhatIf']
+    }
+    else {
+        $params['Confirm'] = $false
+    }
+    Uninstall-Rapid7InsightAgentHardened @params
 }
